@@ -1,0 +1,85 @@
+name: Build unsigned IPA
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: xcodebuild -> unsigned .ipa (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        # macos-15 是当前稳定镜像；macos-14 作为兜底。两个并行跑，任一出包即可用。
+        os: [ macos-15, macos-14 ]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: |
+          sw_vers
+          xcodebuild -version
+          xcodebuild -showsdks | grep -i iphoneos || true
+
+      - name: Clean
+        run: |
+          xcodebuild -project HelloDSH.xcodeproj -scheme HelloDSH clean
+
+      - name: Archive (unsigned)
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project HelloDSH.xcodeproj \
+            -scheme HelloDSH \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$RUNNER_TEMP/HelloDSH.xcarchive" \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGN_ENTITLEMENTS="" \
+            DEVELOPMENT_TEAM="" \
+            PROVISIONING_PROFILE_SPECIFIER="" \
+            archive
+
+      - name: Package .ipa (Payload folder, unsigned)
+        run: |
+          set -euo pipefail
+          APP="$RUNNER_TEMP/HelloDSH.xcarchive/Products/Applications/HelloDSH.app"
+          test -d "$APP" || { echo "::error::找不到 HelloDSH.app"; exit 1; }
+          mkdir -p "$RUNNER_TEMP/ipa/Payload"
+          cp -R "$APP" "$RUNNER_TEMP/ipa/Payload/"
+          echo "--- 产物内容 ---"
+          ls -la "$RUNNER_TEMP/ipa/Payload/HelloDSH.app"
+          echo "--- 应无 _CodeSignature（未签名）---"
+          ls "$RUNNER_TEMP/ipa/Payload/HelloDSH.app/_CodeSignature" 2>/dev/null \
+            && echo "::warning::存在 _CodeSignature，签名可能未完全剥离" \
+            || echo "OK: 未签名"
+          cd "$RUNNER_TEMP/ipa"
+          zip -qry HelloDSH-unsigned.ipa Payload
+          ls -lh HelloDSH-unsigned.ipa
+          echo "IPA_PATH=$RUNNER_TEMP/ipa/HelloDSH-unsigned.ipa" >> "$GITHUB_ENV"
+
+      - name: Verify ipa structure
+        run: |
+          set -euo pipefail
+          unzip -l "$IPA_PATH"
+          unzip -p "$IPA_PATH" "Payload/HelloDSH.app/Info.plist" > /tmp/plist.bin
+          plutil -p /tmp/plist.bin
+          BID=$(plutil -extract CFBundleIdentifier raw /tmp/plist.bin)
+          echo "Bundle ID = $BID"
+          echo "### Bundle ID: \`$BID\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: HelloDSH-unsigned-ipa-${{ matrix.os }}
+          path: ${{ env.IPA_PATH }}
+          if-no-files-found: error
+          retention-days: 30
